@@ -1061,10 +1061,16 @@ function ModalTraspaso({ bien, onClose, onDone, dark, t, allAreas }) {
   //     consecutivo que le tocan en esa área.
   // Antes se movía el mismo registro al destino, así que la dependencia que
   // entregaba se quedaba sin rastro del bien y el traspaso no salía por ningún lado.
+  //
+  // Los dos pasos van juntos o no va ninguno. Primero se marca el de origen y
+  // solo si de verdad se marcó se da de alta el de destino; si el alta falla, el
+  // de origen regresa como estaba. Antes era al revés: el alta entraba y, si la
+  // marca del origen no se aplicaba, el bien quedaba ACTIVO en las dos áreas.
   async function confirmar() {
-    if (!dep) { setErr('Selecciona el área destino'); return }
+    if (!dep || guardando) return
     setGuardando(true); setErr(null)
     let facturaCreada = null
+    let origenAntes = null
     try {
       // Recalcula la clave por si otro usuario tomó el consecutivo mientras tanto
       const gen = await siguienteClave({ idarea: dep, tipo: tipoBien, anio: anioBien })
@@ -1090,7 +1096,31 @@ function ModalTraspaso({ bien, onClose, onDone, dark, t, allAreas }) {
       // Titular del destino: se reutiliza la persona si ya está en el catálogo.
       // Si no se captura ninguna, el bien llega sin resguardo.
       const idresguardo = resg.trim() ? await resolverResguardo(resg, puesto) : null
-      const { estado, resto } = partirObs(bien.observaciones)
+
+      // Se lee el registro de origen tal como está en la base (no como lo tiene
+      // la tabla en pantalla) para poder dejarlo igual si algo sale mal.
+      const { data: actual, error: eA } = await supabase.from('bienes')
+        .select('estadobien, observaciones').eq('idbien', bien.idbien).maybeSingle()
+      if (eA) throw eA
+      if (!actual) throw new Error('No se encontró el bien. Recarga la página e inténtalo de nuevo.')
+      if (!['ACTIVO', 'SOLICITUD BAJA'].includes(actual.estadobien))
+        throw new Error(`Este bien ya no está activo (estado: ${actual.estadobien}). Puede que ya se haya traspasado; recarga la página.`)
+      const { estado, resto } = partirObs(actual.observaciones)
+
+      // ── El registro que SALE del origen ─────────────────────────────────────
+      // No se le cambia el área ni la clave: así la dependencia que entregó lo
+      // sigue viendo, con su número de siempre, en el apartado de traspasos.
+      // La condición del estado evita traspasarlo dos veces si otra persona lo
+      // hizo al mismo tiempo, y el select confirma que la fila sí se modificó:
+      // si la base no deja cambiarla, no marca error, solo no cambia nada.
+      const { data: marcados, error: eUpd } = await supabase.from('bienes').update({
+        estadobien:    'TRASPASO',
+        observaciones: unirObs(estado, [resto, notaSale].filter(Boolean).join(' | ')),
+      }).eq('idbien', bien.idbien).eq('estadobien', actual.estadobien).select('idbien')
+      if (eUpd) throw eUpd
+      if (!marcados || marcados.length === 0)
+        throw new Error('No se pudo marcar el bien como traspasado en su área de origen, así que no se hizo el traspaso. Recarga la página e inténtalo de nuevo.')
+      origenAntes = actual
 
       // ── El registro que LLEGA al destino ────────────────────────────────────
       // Ni idbien ni idfactura son autoincrementales: se toman del máximo actual.
@@ -1142,22 +1172,22 @@ function ModalTraspaso({ bien, onClose, onDone, dark, t, allAreas }) {
       if (eIns && /fechaalta/i.test(eIns.message || '')) eIns = (await supabase.from('bienes').insert(nuevo)).error
       if (eIns) throw eIns
 
-      // ── El registro que SALE del origen ─────────────────────────────────────
-      // No se le cambia el área ni la clave: así la dependencia que entregó lo
-      // sigue viendo, con su número de siempre, en el apartado de traspasos.
-      const { error: eUpd } = await supabase.from('bienes').update({
-        estadobien:    'TRASPASO',
-        observaciones: unirObs(estado, [resto, notaSale].filter(Boolean).join(' | ')),
-      }).eq('idbien', bien.idbien)
-      if (eUpd) throw eUpd
-
       onDone && onDone()
       close()
     } catch (e) {
       // Si el alta falló después de crear la factura, se borra: si no, quedaría
       // suelta y el reporte de adquisiciones la contaría sin ningún bien detrás.
       if (facturaCreada != null) await supabase.from('facturas').delete().eq('idfactura', facturaCreada)
-      setErr(e.message); setGuardando(false)
+      // Y el de origen vuelve a quedar como estaba, para que el bien no
+      // desaparezca de su área sin haber llegado a la otra.
+      let msg = e.message
+      if (origenAntes) {
+        const { error: eR } = await supabase.from('bienes')
+          .update({ estadobien: origenAntes.estadobien, observaciones: origenAntes.observaciones })
+          .eq('idbien', bien.idbien)
+        if (eR) msg += ' Además no se pudo regresar el bien a su área de origen: revísalo en Traspasos.'
+      }
+      setErr(msg); setGuardando(false)
     }
   }
 
